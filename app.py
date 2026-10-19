@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import html
 import io
+import re
 from pathlib import Path
 
 import numpy as np
@@ -234,7 +235,7 @@ def normalise(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
     if "payment_method" in df.columns:
         df["payment_method"] = (df["payment_method"].astype(str).str.strip().str.lower()
-                                .str.replace(r"[\s_\-]+", "", regex=True))
+                                .str.replace(r"[\s_\-]+", "", regex=True).replace(PAY_ALIASES))
     return df
 
 
@@ -264,15 +265,116 @@ def prepare(raw: pd.DataFrame, need_label: bool = False):
         if not set(df[c].unique()) <= {0, 1}:
             errors.append(f"{c} must contain only 0 and 1.")
     has_label = TARGET in df.columns and df[TARGET].nunique() == 2
-    if TARGET in df.columns and not has_label:
-        notes.append("is_fraud has a single class, so label-based checks are skipped.")
     if need_label and not has_label:
-        errors.append("This dataset needs an is_fraud column with both 0 and 1.")
-    if has_label:
+        errors.append("This dataset needs a fraud label column with both fraud (1) and legit (0) rows.")
+    if TARGET in df.columns:
         df[TARGET] = df[TARGET].astype(int)
     if errors:
         return None, errors, notes, has_label
     return df, errors, notes, has_label
+
+
+# ------------------------------------------------- matching other people's columns
+LABEL_ALIASES = ["is_fraud", "isfraud", "fraud", "fraud_flag", "is_fraudulent", "fraudulent", "label", "target",
+                 "class", "y", "outcome", "chargeback"]
+FEATURE_ALIASES = {
+    "order_amount": ["amount", "order_value", "order_total", "total", "basket_value", "value"],
+    "account_age_days": ["account_age", "age_days", "customer_age_days", "days_since_signup", "tenure_days"],
+    "hour_of_day": ["hour", "order_hour", "time_of_day"],
+    "num_orders_last_7d": ["orders_last_7d", "orders_7d", "num_orders_7d", "orders_last_week", "recent_orders"],
+    "payment_method": ["payment", "payment_type", "pay_method"],
+    "delivery_distance_km": ["distance_km", "distance", "delivery_distance"],
+    "discount_applied": ["discount", "promo", "promo_used", "promo_applied", "coupon"],
+    "prev_refunds": ["refunds", "previous_refunds", "num_refunds", "refund_count"],
+    "device_change": ["new_device", "device_changed"],
+    "location_mismatch": ["address_mismatch", "geo_mismatch", "billing_mismatch"],
+}
+PAY_ALIASES = {"cashondelivery": "cod", "cash": "cod", "creditcard": "card", "debitcard": "card", "credit": "card",
+               "debit": "card", "visa": "card", "mastercard": "card", "apple": "applepay", "applepay": "applepay"}
+
+
+def _key(x) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(x).strip().lower()).strip("_")
+
+
+def auto_map(columns) -> dict:
+    """Best guess of {our column: their column}, matching by name and common aliases."""
+    keys = {_key(c): str(c) for c in columns}
+    m = {}
+    for req in FEATURES:
+        for cand in [req] + FEATURE_ALIASES[req]:
+            if cand in keys:
+                m[req] = keys[cand]
+                break
+    for cand in LABEL_ALIASES:
+        if cand in keys:
+            m[TARGET] = keys[cand]
+            break
+    return m
+
+
+def to_binary(s: pd.Series) -> pd.Series:
+    """Turn a label column (0/1, True/False, yes/no, fraud/legit ...) into 0/1. Unknown values become NaN."""
+    if pd.api.types.is_bool_dtype(s):
+        return s.astype(float)
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().mean() > 0.95:
+        u = sorted(num.dropna().unique())
+        if len(u) == 1:
+            return (num > 0).astype(float).where(num.notna())
+        if len(u) == 2:
+            return (num == u[1]).astype(float).where(num.notna())
+        return pd.Series(np.nan, index=s.index)
+    t = s.astype(str).str.strip().str.lower()
+    pos = {"1", "true", "yes", "y", "t", "fraud", "fraudulent", "fake", "bad", "positive", "chargeback"}
+    neg = {"0", "false", "no", "n", "f", "legit", "legitimate", "genuine", "good", "normal", "negative", "ok", "clean"}
+    out = pd.Series(np.nan, index=s.index)
+    out[t.isin(pos)] = 1.0
+    out[t.isin(neg)] = 0.0
+    return out
+
+
+def canonicalise(raw: pd.DataFrame, m: dict) -> pd.DataFrame:
+    """Rename the chosen columns to our names. m = {our column: their column}."""
+    out = pd.DataFrame({f: raw[m[f]].values for f in FEATURES})
+    if TARGET in m:
+        out[TARGET] = to_binary(raw[m[TARGET]]).values
+    return out
+
+
+def label_state(df: pd.DataFrame) -> str:
+    """none | both | fraud_only | legit_only"""
+    if TARGET not in df.columns:
+        return "none"
+    u = set(pd.Series(df[TARGET]).dropna().astype(int).unique())
+    return "both" if u == {0, 1} else ("fraud_only" if u == {1} else ("legit_only" if u == {0} else "none"))
+
+
+def ingest(raw: pd.DataFrame, key: str):
+    """Let the user match uploaded columns to ours. Returns (canonical_df or None, still_missing_columns)."""
+    raw = raw.rename(columns=str)
+    auto = auto_map(raw.columns)
+    opts = ["(not in file)"] + list(raw.columns)
+    fp = hashlib.md5(("|".join(raw.columns) + str(len(raw))).encode()).hexdigest()[:8]
+    missing_auto = [f for f in FEATURES if f not in auto]
+    renamed = {f: c for f, c in auto.items() if _key(c) != f}
+    chosen = {}
+    with st.expander("Match columns" + (" (needs your attention)" if missing_auto else ""), expanded=bool(missing_auto)):
+        if missing_auto:
+            st.caption("Some columns were not found by name. Pick the matching column from the file for each one.")
+        else:
+            st.caption("Columns were matched by name" + (f"; renamed: {', '.join(f'{c} as {f}' for f, c in renamed.items())}" if renamed else "")
+                       + ". Change a match if it is wrong.")
+        grid = st.columns(3)
+        for i, f in enumerate(FEATURES + [TARGET]):
+            d = auto.get(f)
+            chosen[f] = grid[i % 3].selectbox(PRETTY.get(f, "Fraud label (is_fraud)"), opts,
+                                              index=opts.index(d) if d in opts else 0, key=f"{key}_{fp}_{f}")
+    m = {f: c for f, c in chosen.items() if c != opts[0]}
+    missing = [f for f in FEATURES if f not in m]
+    if missing:
+        return None, missing
+    return canonicalise(raw, m), []
 
 
 def encode(df: pd.DataFrame) -> pd.DataFrame:
@@ -735,9 +837,13 @@ def tab_batch(B, df_ours, cutoff, review_from):
         except Exception as e:  # noqa: BLE001
             st.error(f"Could not read that file as a CSV: {e}")
             return
-        df, errs, notes, has_label = prepare(raw)
+        canon, miss = ingest(raw, "batch")
+        if miss:
+            st.error("Pick a column in the file for: " + ", ".join(PRETTY[m] for m in miss) + ".")
+            return
+        df, errs, notes, has_label = prepare(canon)
         if errs:
-            st.error(" ".join(errs) + " Expected columns: " + ", ".join(FEATURES) + ".")
+            st.error(" ".join(errs))
             return
         for n in notes:
             st.caption(n)
@@ -772,6 +878,13 @@ def tab_batch(B, df_ours, cutoff, review_from):
             callout(f"Of <b>{m['tp'] + m['fn']}</b> fraud orders the desk caught <b>{m['tp']}</b> ({pct(m['recall'], 0)}). "
                     f"Of <b>{m['tp'] + m['fp']}</b> flagged, <b>{m['tp']}</b> were real ({pct(m['precision'], 0)}). "
                     f"Ranking quality (AUC) on this file: <b>{auc:.2f}</b>.")
+    elif TARGET in scored.columns and label_state(scored) in ("fraud_only", "legit_only"):
+        only_fraud = label_state(scored) == "fraud_only"
+        flagged = float((scored["risk"] >= cutoff).mean())
+        reviewed = float((scored["risk"] >= review_from).mean())
+        callout(f"Every row in this file is labelled <b>{'fraud' if only_fraud else 'legit'}</b>. The desk "
+                f"{'flagged' if only_fraud else 'raised a false alarm on'} <b>{pct(flagged)}</b> of them and sent "
+                f"<b>{pct(max(reviewed - flagged, 0))}</b> more to review.")
     section("Highest-risk orders", "Sorted by risk, top 150 shown. Download the full file below.")
     scored = scored.sort_values("risk", ascending=False)
     st.markdown(risk_table(scored), unsafe_allow_html=True)
@@ -840,33 +953,29 @@ def single_aucs(df: pd.DataFrame, y: np.ndarray) -> dict:
 
 
 @st.cache_data(show_spinner="Comparing the two datasets (training both models)...")
-def compare_core(_a: pd.DataFrame, _b: pd.DataFrame, ka: str, kb: str, b_labelled: bool):
+def compare_core(_a: pd.DataFrame, _b: pd.DataFrame, ka: str, kb: str, labelled: bool):
+    """labelled=True means both frames carry is_fraud with fraud and legit rows."""
     out = dict(gaps={f: gap(_a, _b, f) for f in FEATURES})
-    ya = _a[TARGET].values
-    oof_a, _ = cv_oof(_a, ya, importance=False)
-    out["cv_a"] = fast_auc(ya, oof_a)
-    out["single_a"] = single_aucs(_a, ya)
-    out["sig_a"] = signature(_a)
-    model_a = make_model().fit(encode(_a), ya)
-    if b_labelled:
-        yb = _b[TARGET].values
+    if labelled:
+        ya, yb = _a[TARGET].values, _b[TARGET].values
+        oof_a, _ = cv_oof(_a, ya, importance=False)
         oof_b, _ = cv_oof(_b, yb, importance=False)
-        out["cv_b"] = fast_auc(yb, oof_b)
-        out["single_b"] = single_aucs(_b, yb)
-        out["sig_b"] = signature(_b)
+        out["cv_a"], out["cv_b"] = fast_auc(ya, oof_a), fast_auc(yb, oof_b)
+        out["single_a"], out["single_b"] = single_aucs(_a, ya), single_aucs(_b, yb)
+        out["sig_a"], out["sig_b"] = signature(_a), signature(_b)
+        model_a = make_model().fit(encode(_a), ya)
         model_b = make_model().fit(encode(_b), yb)
         out["a_on_b"] = fast_auc(yb, proba(model_a, _b))
         out["b_on_a"] = fast_auc(ya, proba(model_b, _a))
     # can a classifier tell the two datasets apart?
     sa = _a.sample(min(4000, len(_a)), random_state=1)
     sb = _b.sample(min(4000, len(_b)), random_state=1)
-    D = pd.concat([sa, sb], ignore_index=True)
+    D = pd.concat([sa[FEATURES], sb[FEATURES]], ignore_index=True)
     yd = np.r_[np.zeros(len(sa)), np.ones(len(sb))].astype(int)
     oof_d, imp_d = cv_oof(D, yd, importance=True)
     out["tell_auc"], out["tell_imp"] = fast_auc(yd, oof_d), imp_d
-    cc = CORR_COLS + ([TARGET] if b_labelled else [])
-    out["corr_a"] = _a[CORR_COLS + [TARGET]].corr().loc[cc, cc]
-    out["corr_b"] = _b[cc].corr().loc[cc, cc] if b_labelled else _b[CORR_COLS].corr()
+    cc = CORR_COLS + ([TARGET] if labelled else [])
+    out["corr_a"], out["corr_b"] = _a[cc].corr(), _b[cc].corr()
     return out
 
 
@@ -938,9 +1047,31 @@ def grid_html(rows_a: str, rows_b: str, na: str, nb: str, aa, ab, ba, bb) -> str
 </div>"""
 
 
-def tab_compare(df_a: pd.DataFrame, na: str, nb: str):
+def score_overlay(B, p_b, na, nb, cutoff, review_from) -> go.Figure:
+    oof, y = B["oof"], B["y"]
+    hi = float(np.quantile(np.concatenate([oof, p_b]), 0.995))
+    edges = np.linspace(0, max(hi, cutoff * 1.5), 36)
+    ctr = (edges[:-1] + edges[1:]) / 2
+    fig = go.Figure()
+    for nm, vals, col, dash in ((f"{na}: legit orders", oof[y == 0], C["muted"], "dot"),
+                                (f"{na}: fraud orders", oof[y == 1], C["a"], "solid"),
+                                (nb, p_b, C["b"], "solid")):
+        h, _ = np.histogram(vals, bins=edges)
+        fig.add_trace(go.Scatter(x=ctr, y=h / max(len(vals), 1), mode="lines", name=nm,
+                                 line=dict(color=col, width=2.5, dash=dash, shape="spline"),
+                                 hovertemplate=f"{nm}<br>Score %{{x:.0%}}: %{{y:.1%}} of group<extra></extra>"))
+    for x, txt in ((review_from, "review"), (cutoff, "fraud")):
+        fig.add_vline(x=x, line=dict(color=C["muted"], width=1, dash="dash"))
+        fig.add_annotation(x=x, y=1.0, yref="paper", text=txt, showarrow=False, yshift=10, font=dict(color=C["ink2"], size=11))
+    fig.update_xaxes(title="Fraud score from our qualifier", tickformat=".0%")
+    fig.update_yaxes(title="Share of group", tickformat=".0%")
+    return style(fig, 330, margin=dict(l=8, r=8, t=40, b=8))
+
+
+def tab_compare(df_a: pd.DataFrame, na: str, nb: str, B, cutoff: float, review_from: float):
     section("Compare against another GAN dataset",
-            "Upload the other team's CSV. It needs the same ten columns and, for the fraud-pattern checks, an is_fraud column.")
+            "Upload the other team's CSV. If their column names differ from ours, you can match them after uploading. "
+            "A file that holds only fraud (or only legit) rows works too.")
     up = st.file_uploader("Other dataset (CSV)", type=["csv"], key="cmp_up", label_visibility="collapsed")
     c1, c2 = st.columns([1, 3])
     if c1.button("Dry run with a demo dataset"):
@@ -955,9 +1086,13 @@ def tab_compare(df_a: pd.DataFrame, na: str, nb: str):
         except Exception as e:  # noqa: BLE001
             st.error(f"Could not read that file as a CSV: {e}")
             return
-        df_b, errs, notes, _ = prepare(raw)
+        canon, miss = ingest(raw, "cmp")
+        if miss:
+            st.error("Pick a column in the file for: " + ", ".join(PRETTY[m] for m in miss) + ".")
+            return
+        df_b, errs, notes, _ = prepare(canon)
         if errs:
-            st.error(" ".join(errs) + " Expected columns: " + ", ".join(FEATURES + [TARGET]) + ".")
+            st.error(" ".join(errs))
             return
         source = f"{up.name}: {len(df_b):,} rows"
     elif st.session_state.get("cmp_demo"):
@@ -973,14 +1108,40 @@ def tab_compare(df_a: pd.DataFrame, na: str, nb: str):
     if len(df_b) > 50000:
         df_b = df_b.sample(50000, random_state=1).reset_index(drop=True)
         st.caption("Their dataset was sampled down to 50,000 rows for speed.")
-    labelled = TARGET in df_b.columns and df_b[TARGET].nunique() == 2
-    if not labelled:
-        st.warning("No usable is_fraud column in this file, so fraud-pattern and cross-test sections are skipped.")
-    st.markdown(f"<div class='legend-line'><span class='dot' style='background:{C['a']}'></span>{esc(na)} &nbsp;&nbsp; "
+
+    state = label_state(df_b)          # none | both | fraud_only | legit_only
+    labelled, single = state == "both", state in ("fraud_only", "legit_only")
+    cls = 1 if state == "fraud_only" else 0
+    word = "fraud" if cls == 1 else "legit"
+    n_ours = int((df_a[TARGET] == cls).sum())
+    if state == "none":
+        st.info("No fraud label found. I looked for is_fraud, fraud, label, target and similar names. If it has another name, "
+                "pick it under Match columns. Until then the label-based sections are skipped.")
+    elif single:
+        st.info(f"Every row in this file is labelled {word} ({len(df_b):,} of {len(df_b):,}). A one-class file cannot show how "
+                f"fraud differs from legit, so this page compares their rows with our {n_ours:,} {word} rows"
+                + (" and tests whether our qualifier catches them." if cls == 1 else " and tests how often our qualifier raises false alarms on them."))
+
+    # frames and labels used for the side-by-side parts
+    if single:
+        fa = df_a[df_a[TARGET] == cls].drop(columns=TARGET).reset_index(drop=True)
+        fb = df_b.drop(columns=TARGET)
+        la = f"{na} ({word} rows)"
+    else:
+        fa, fb, la = df_a, df_b, na
+    st.markdown(f"<div class='legend-line'><span class='dot' style='background:{C['a']}'></span>{esc(la)} &nbsp;&nbsp; "
                 f"<span class='dot' style='background:{C['b']}'></span>{esc(nb)} &nbsp;&nbsp; {esc(source)}</div>", unsafe_allow_html=True)
 
-    R = compare_core(df_a, df_b, dfkey(df_a), dfkey(df_b), labelled)
+    R = compare_core(fa, fb, dfkey(fa), dfkey(fb), labelled)
     avg_gap = float(np.mean(list(R["gaps"].values())))
+
+    # score their rows with our qualifier (single-class files)
+    if single:
+        p_b = proba(B["model"], df_b)
+        theirs = float((p_b >= cutoff).mean())
+        ours = float((B["oof"][B["y"] == cls] >= cutoff).mean())
+        theirs_r = float((p_b >= review_from).mean())
+        ours_r = float((B["oof"][B["y"] == cls] >= review_from).mean())
 
     # ---- headline
     items = [(f"{avg_gap:.2f}", "Average distribution gap", "0 = identical, 1 = no overlap"),
@@ -988,21 +1149,33 @@ def tab_compare(df_a: pd.DataFrame, na: str, nb: str):
     if labelled:
         items += [(f"{R['a_on_b']:.2f}", f"{na} model on {nb}", f"{R['cv_a']:.2f} on its own data"),
                   (f"{R['b_on_a']:.2f}", f"{nb} model on {na}", f"{R['cv_b']:.2f} on its own data")]
+    if single:
+        what = "Their fraud flagged by our qualifier" if cls == 1 else "False alarms on their legit rows"
+        items += [(pct(theirs, 0), what, f"{pct(ours, 0)} for our own {word} rows, out-of-fold"),
+                  (pct(theirs_r, 0), "Flagged or sent to review", f"{pct(ours_r, 0)} for our own {word} rows")]
     kpis(items)
     bits = [f"The two datasets differ by <b>{avg_gap:.2f}</b> on average across the ten columns",
             f"a classifier separates their rows with AUC <b>{R['tell_auc']:.2f}</b>"]
     if labelled:
         bits.append(f"a fraud model trained on {esc(na)} reaches AUC <b>{R['a_on_b']:.2f}</b> on {esc(nb)}, versus <b>{R['cv_a']:.2f}</b> on its own data")
+    if single and cls == 1:
+        bits.append(f"our qualifier flags <b>{pct(theirs, 0)}</b> of their fraud versus <b>{pct(ours, 0)}</b> of ours, so their fraud is "
+                    + ("<b>easier to spot</b> than ours" if theirs > ours * 1.15 else ("<b>harder to spot</b> than ours" if theirs < ours * 0.85 else "about as easy to spot as ours")))
+    elif single:
+        bits.append(f"our qualifier raises a false alarm on <b>{pct(theirs, 0)}</b> of their legit rows versus <b>{pct(ours, 0)}</b> of ours")
     callout("; ".join(bits) + ".")
 
     # ---- scorecard
     section("Scorecard", "Health checks for each dataset on its own. The bands are rules of thumb for realistic fraud data, not hard limits.")
     sa = dict(rows=len(df_a), fr=float(df_a[TARGET].mean()), dup=float(df_a.duplicated().mean()))
-    sb = dict(rows=len(df_b), fr=float(df_b[TARGET].mean()) if labelled else None, dup=float(df_b.duplicated().mean()))
-    rows = [("Rows", f"{sa['rows']:,}", f"{sb['rows']:,}", "", ""),
-            ("Fraud rate", pct(sa["fr"], 2), pct(sb["fr"], 2) if labelled else "n/a",
-             chip(0.01 <= sa["fr"] <= 0.08, "1-8%", "outside 1-8%"),
-             chip(labelled and 0.01 <= sb["fr"] <= 0.08, "1-8%", "outside 1-8%") if labelled else ""),
+    sb = dict(rows=len(df_b), fr=float(df_b[TARGET].mean()) if state != "none" else None, dup=float(df_b.duplicated().mean()))
+    if state == "none":
+        fr_row = ("Fraud rate", pct(sa["fr"], 2), "n/a", chip(0.01 <= sa["fr"] <= 0.08, "1-8%", "outside 1-8%"), "")
+    else:
+        fr_row = ("Fraud rate", pct(sa["fr"], 2), pct(sb["fr"], 2) + (" (one-class file)" if single else ""),
+                  chip(0.01 <= sa["fr"] <= 0.08, "1-8%", "outside 1-8%"),
+                  chip(0.01 <= sb["fr"] <= 0.08, "1-8%", "outside 1-8%"))
+    rows = [("Rows", f"{sa['rows']:,}", f"{sb['rows']:,}", "", ""), fr_row,
             ("Duplicate rows", pct(sa["dup"], 2), pct(sb["dup"], 2),
              chip(sa["dup"] <= 0.02, "under 2%", "over 2%"), chip(sb["dup"] <= 0.02, "under 2%", "over 2%"))]
     if labelled:
@@ -1019,19 +1192,24 @@ def tab_compare(df_a: pd.DataFrame, na: str, nb: str):
     st.markdown(f"<div class='tbl-wrap'><table class='tbl'><thead><tr><th></th><th>{esc(na)}</th><th>{esc(nb)}</th></tr></thead>"
                 f"<tbody>{body}</tbody></table></div>", unsafe_allow_html=True)
 
+    # ---- how our qualifier treats their rows (one-class files)
+    if single:
+        section("Does our qualifier catch their fraud?" if cls == 1 else "How often does our qualifier cry wolf on their legit rows?",
+                "Fraud score distributions. Dotted: our legit orders. Blue: our fraud. Gold: their rows, scored by a model trained only on our data.")
+        show(score_overlay(B, p_b, na, nb, cutoff, review_from), key="cmp_overlay")
+
     # ---- distributions
     section("Column by column", "Share of rows at each value. Closer curves mean the datasets describe the same kind of orders.")
-    mode = "All rows"
+    fa_d, fb_d, la_d = fa, fb, la
     if labelled:
         mode = st.radio("Rows to compare", ["All rows", "Legit only", "Fraud only"], horizontal=True, label_visibility="collapsed")
-    fa, fb = df_a, df_b
-    if mode != "All rows":
-        v = 1 if mode == "Fraud only" else 0
-        fa, fb = df_a[df_a[TARGET] == v], df_b[df_b[TARGET] == v]
-    if min(len(fa), len(fb)) < 30:
+        if mode != "All rows":
+            v = 1 if mode == "Fraud only" else 0
+            fa_d, fb_d = df_a[df_a[TARGET] == v], df_b[df_b[TARGET] == v]
+    if min(len(fa_d), len(fb_d)) < 30:
         st.info("Too few rows in one dataset for this slice to be meaningful.")
     else:
-        show(dist_figure(fa, fb, na, nb), key="cmp_dist")
+        show(dist_figure(fa_d, fb_d, la_d, nb), key="cmp_dist")
 
     g = pd.Series(R["gaps"]).sort_values()
     c1, c2 = st.columns(2, gap="large")
@@ -1049,26 +1227,41 @@ def tab_compare(df_a: pd.DataFrame, na: str, nb: str):
         fig.update_xaxes(title="AUC drop when shuffled")
         show(style(rounded(fig), 380, legend=False))
 
-    if not labelled:
-        return
     # ---- fraud patterns
-    section("Fraud patterns", "How far fraud rows sit from legit rows on each signal, in each dataset. Longer bars mean a stronger tell.")
-    sig = pd.DataFrame({na: R["sig_a"], nb: R["sig_b"]})
-    sig = sig.reindex(sig.abs().max(axis=1).sort_values().index)
-    fig = go.Figure()
-    for nm, col in ((na, C["a"]), (nb, C["b"])):
-        fig.add_trace(go.Bar(x=sig[nm], y=[PRETTY[i] for i in sig.index], orientation="h", name=nm, marker=dict(color=col),
-                             hovertemplate=f"{nm}<br>%{{y}}<br>gap %{{x:.2f}}<extra></extra>"))
-    fig.update_layout(barmode="group", bargap=0.3)
-    fig.update_xaxes(title="Standardised difference (right: higher in fraud, left: lower)")
-    show(style(rounded(fig), 520))
-    agree = float(np.corrcoef(R["sig_a"].values, R["sig_b"].reindex(R["sig_a"].index).values)[0, 1])
-    callout(f"The two datasets agree on which signals matter with correlation <b>{agree:.2f}</b> "
-            f"(1.00 means the same fraud story, 0 means unrelated, negative means opposite).")
+    sig = None
+    if labelled:
+        section("Fraud patterns", "How far fraud rows sit from legit rows on each signal, in each dataset. Longer bars mean a stronger tell.")
+        sig = pd.DataFrame({na: R["sig_a"], nb: R["sig_b"]})
+        xtitle = "Standardised difference (right: higher in fraud, left: lower)"
+    elif single and cls == 1:
+        section("Fraud patterns", "How far each dataset's fraud rows sit from our legit orders, in standard deviations of our legit orders. "
+                                  "Longer bars mean a stronger tell.")
+        ref = encode(df_a[df_a[TARGET] == 0])
+        mu, sd = ref.mean(), ref.std().replace(0, 1)
+        sig = pd.DataFrame({la: (encode(fa).mean() - mu) / sd, nb: (encode(fb).mean() - mu) / sd})
+        xtitle = "Distance from our legit orders (right: higher, left: lower)"
+    if sig is not None:
+        c1n, c2n = list(sig.columns)
+        sig = sig.reindex(sig.abs().max(axis=1).sort_values().index)
+        fig = go.Figure()
+        for nm, col in ((c1n, C["a"]), (c2n, C["b"])):
+            fig.add_trace(go.Bar(x=sig[nm], y=[PRETTY[i] for i in sig.index], orientation="h", name=nm, marker=dict(color=col),
+                                 hovertemplate=f"{nm}<br>%{{y}}<br>gap %{{x:.2f}}<extra></extra>"))
+        fig.update_layout(barmode="group", bargap=0.3)
+        fig.update_xaxes(title=xtitle)
+        show(style(rounded(fig), 520))
+        agree = float(np.corrcoef(sig[c1n].values, sig[c2n].values)[0, 1])
+        callout(f"The two datasets agree on which signals matter with correlation <b>{agree:.2f}</b> "
+                f"(1.00 means the same fraud story, 0 means unrelated, negative means opposite).")
+    elif single:
+        st.caption("Fraud patterns need fraud rows, so that section is skipped for a legit-only file.")
 
     # ---- cross test
-    section("Cross-test", "Train a fraud model on one dataset and score the other. High numbers off the diagonal mean the fraud rules transfer.")
-    st.markdown(grid_html("", "", na, nb, R["cv_a"], R["a_on_b"], R["b_on_a"], R["cv_b"]), unsafe_allow_html=True)
+    if labelled:
+        section("Cross-test", "Train a fraud model on one dataset and score the other. High numbers off the diagonal mean the fraud rules transfer.")
+        st.markdown(grid_html("", "", na, nb, R["cv_a"], R["a_on_b"], R["b_on_a"], R["cv_b"]), unsafe_allow_html=True)
+    elif single:
+        st.caption("The two-way cross-test needs both classes in both files. The qualifier check above covers one direction.")
 
     # ---- correlations
     section("Correlations", "Pearson correlation between columns. Red: move together. Blue: move opposite.")
@@ -1076,15 +1269,17 @@ def tab_compare(df_a: pd.DataFrame, na: str, nb: str):
     ca, cb = R["corr_a"], R["corr_b"]
     cols_common = [c for c in ca.columns if c in cb.columns]
     with cc[0]:
-        show(corr_figure(ca.loc[cols_common, cols_common], 1, na), key="corr_a")
+        show(corr_figure(ca.loc[cols_common, cols_common], 1, la), key="corr_a")
     with cc[1]:
         show(corr_figure(cb.loc[cols_common, cols_common], 1, nb), key="corr_b")
     with cc[2]:
-        show(corr_figure(ca.loc[cols_common, cols_common] - cb.loc[cols_common, cols_common], 0.6, f"{na} minus {nb}"), key="corr_d")
+        show(corr_figure(ca.loc[cols_common, cols_common] - cb.loc[cols_common, cols_common], 0.6, f"{la} minus {nb}"), key="corr_d")
 
     # ---- download
-    summary = pd.DataFrame([{"column": f, "gap": R["gaps"][f], f"{na} fraud signal": R["sig_a"].get(f, np.nan),
-                             f"{nb} fraud signal": R["sig_b"].get(f, np.nan)} for f in FEATURES])
+    summary = pd.DataFrame([{"column": f, "gap": R["gaps"][f]} for f in FEATURES])
+    if labelled:
+        summary[f"{na} fraud signal"] = [R["sig_a"].get(f, np.nan) for f in FEATURES]
+        summary[f"{nb} fraud signal"] = [R["sig_b"].get(f, np.nan) for f in FEATURES]
     st.download_button("Download comparison summary (CSV)", summary.to_csv(index=False).encode(), "dataset_comparison.csv",
                        "text/csv")
 
@@ -1118,10 +1313,16 @@ def load_ours():
     if up is not None:
         raw, label = parse_csv(up.getvalue()), up.name
     elif DEFAULT_DATA.exists():
-        raw, label = pd.read_csv(DEFAULT_DATA), DEFAULT_DATA.name
+        raw, label = parse_csv(DEFAULT_DATA.read_bytes()), DEFAULT_DATA.name
     else:
         return None, None, [], "No dataset found"
-    df, errs, notes, _ = prepare(raw, need_label=True)
+    raw = raw.rename(columns=str)
+    m = auto_map(raw.columns)
+    miss = [f for f in FEATURES + [TARGET] if f not in m]
+    if miss:
+        return None, label, [], ("Could not find columns for: " + ", ".join(miss) +
+                                 ". Rename them to our names, or use the Compare tab to match columns by hand.")
+    df, errs, notes, _ = prepare(canonicalise(raw, m), need_label=True)
     return df, label, notes, " ".join(errs)
 
 
@@ -1175,7 +1376,7 @@ def main():
     with t3:
         tab_batch(B, df, cutoff, review_from)
     with t4:
-        tab_compare(df, name_a, name_b)
+        tab_compare(df, name_a, name_b, B, cutoff, review_from)
 
 
 main()
